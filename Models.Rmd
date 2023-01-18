@@ -36,10 +36,26 @@ gl_dis$dev_lang_dis[is.na(gl_dis$dev_lang_dis)] = 0
 load("family_info.RData")
 famtype = family_info$types
 
+load("SES_Info.RData")
+sesinfo = SES_info %>% dplyr::select(subject_sp_id, parent_highest_education)
+### re-map to 4 classes:
+### <= high_school_graduate, <= associate, <= baccalaureat, <= graduate
+sesinfo$parent_edu = as.numeric(sesinfo$parent_highest_education)
+sesinfo$parent_edu = factor(
+  as.numeric(sesinfo$parent_edu > 4) + as.numeric(sesinfo$parent_edu > 7) + 
+  as.numeric(sesinfo$parent_edu > 8)
+)
+
 asd_scores = merge(asd_scores, gl_dis, by="subject_sp_id")
 asd_scores = merge(asd_scores, famtype, by="subject_sp_id")
+asd_scores = merge(asd_scores, sesinfo, by="subject_sp_id")
 
 full_scores = merge(full_scores, gl_dis, by="subject_sp_id")
+full_scores = merge(full_scores, sesinfo, by="subject_sp_id")
+
+asd_scores$sex = factor(asd_scores$sex)
+full_scores$sex = factor(full_scores$sex)
+full_scores$asd = factor(full_scores$asd)
 
 scq_scores = full_data$data[[4]] %>% dplyr::select(subject_sp_id, final_score)
 
@@ -137,263 +153,220 @@ asd_scores$family_type = factor(asd_scores$family_type, levels=c("Unknown", "Sim
 rm(df_scores)
 ```
 
+## Model Evaluation
+
+We mainly report delta R2 for different models
+
+```{r, message=FALSE, warning=FALSE}
+make_blacklist = function(A, B){
+  # black list all connections between variables in A and variables in B
+  out = list()
+  for(x in A) for(y in B)
+    out = c(out, list(c(x, y)))
+  out
+}
+
+make_formula = function(
+    y, cnt=c(), dct=c(), interaction=FALSE, 
+    blacklist=list(), dflist=list()
+){
+  # make a gam formula for y ~ cnt + dct, cnt for continuous variables, 
+  # dct for discrete ones. If interaction is True, put in all two way interactions
+  # that are not in the blacklist
+  blacklist = sapply(blacklist, paste, collapse="-")
+  fml = paste0(y, "~")
+  items = c()
+  for(x in cnt){
+    if(x %in% names(dflist)){
+      items = c(items, paste0("s(", x, ", k=", dflist[[x]], ")"))    
+    } else {
+      items = c(items, paste0("s(", x, ")"))  
+    }
+  }
+  for(y in dct) items = c(items, y)
+  fml = paste0(fml, paste0(items, collapse="+"))
+  if(interaction){
+    if(length(dct) >= 2){
+      for(i in 1:(length(dct)-1)){
+        for(j in (i+1):length(dct)){
+          if(paste(dct[i], dct[j], sep="-") %in% blacklist) next
+          if(paste(dct[j], dct[i], sep="-") %in% blacklist) next
+          fml = paste0(fml, "+", dct[i], ":", dct[j])
+        }
+      }
+    }
+    if(length(cnt) >= 2){
+      for(i in 1:(length(cnt)-1)){
+        for(j in (i+1):length(cnt)){
+          if(paste(cnt[i], cnt[j], sep="-") %in% blacklist) next
+          if(paste(cnt[j], cnt[i], sep="-") %in% blacklist) next
+          fml = paste0(fml, "+ti(", cnt[i], ",", cnt[j], ")")
+        }
+      }
+    }
+    for(x in cnt){
+      for(y in dct){
+        if(paste(x, y, sep="-") %in% blacklist) next
+        if(paste(y, x, sep="-") %in% blacklist) next
+        fml = paste0(fml, "+s(", x, ", by=ordered(", y, "))")
+      }
+    }
+  }
+  as.formula(fml)
+}
+
+eval_model = function(
+    outcome = NULL,  # outcome name
+    covs = list(c(), c()),  # covariates names, list(continuous, discrete)
+    constructs = list(c(), c()),  # construct names, list(continuous, discrete)
+    additional = list(c(), c()),  # additional variables
+    data = NULL,  # data
+    blacklist = list(),  # interaction black list
+    dflist = list() # degree of freedom for s(.)
+){
+  # base model
+  fml_base = make_formula(
+    outcome, covs[[1]], covs[[2]], interaction=FALSE, dflist=dflist
+  )
+  fit_base = mgcv::gam(fml_base, data=data)
+  # base model + constructs
+  fml_const = make_formula(
+    outcome, c(covs[[1]], constructs[[1]]), 
+    c(covs[[2]], constructs[[2]]), interaction=FALSE, dflist=dflist
+  )
+  fit_const = mgcv::gam(fml_const, data=data)
+  # base model + constructs + additional
+  fml_addon = make_formula(
+    outcome, c(covs[[1]], constructs[[1]], additional[[1]]), 
+    c(covs[[2]], constructs[[2]], additional[[2]]), 
+    interaction=FALSE, dflist=dflist
+  )
+  fit_addon = mgcv::gam(fml_addon, data=data)
+  # base model + constructs + additional + interactions
+  fml_int = make_formula(
+    outcome, c(covs[[1]], constructs[[1]], additional[[1]]), 
+    c(covs[[2]], constructs[[2]], additional[[2]]), 
+    interaction=TRUE, blacklist=blacklist, dflist=dflist
+  )
+  fit_int = mgcv::gam(fml_int, data=data)
+  
+  pTable = rbind(
+    summary(fit_int)$pTerms.table, summary(fit_int)$s.table[,c(1,3,4)]
+  )
+  
+  list(
+    fit0=fit_base, fit1=fit_const, fit2=fit_addon, fit3=fit_int,
+    dev_expl=c(summary(fit_base)$dev.expl, summary(fit_const)$dev.expl,
+               summary(fit_addon)$dev.expl, summary(fit_int)$dev.expl),
+    pTable=pTable[,3]
+  )
+}
+
+```
+
+
 ## GL + NV -> Aloof
 
 #### ASD only
 ```{r, message=FALSE, warning=FALSE}
-# Baseline
-fit0 = mgcv::gam(
-  Aloof ~ sex * family_type * dev_lang_dis + s(age_eval_scq) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)), 
+res_GL = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("GL"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-# GL
-fit1 = mgcv::gam(
-  Aloof ~ sex * family_type * dev_lang_dis + 
-    s(GL) + s(age_eval_scq) + ti(GL, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(GL, by=ordered(family_type)) + 
-    s(GL, by=ordered(sex)) + 
-    s(GL, by=ordered(dev_lang_dis)), 
+res_NV = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("NV"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-# NV
-fit2 = mgcv::gam(
-  Aloof ~ sex * family_type * dev_lang_dis + 
-    s(NV) + s(age_eval_scq) + ti(NV, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(NV, by=ordered(family_type)) + 
-    s(NV, by=ordered(sex)) + 
-    s(NV, by=ordered(dev_lang_dis)), 
+res_GL_NV = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("NV", "GL"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-# GL + NV
-fit3 = mgcv::gam(
-  Aloof ~ sex * family_type * dev_lang_dis + 
-    s(GL) + s(NV) + s(age_eval_scq) + 
-    ti(GL, age_eval_scq) + ti(NV, age_eval_scq) + ti(NV, GL) +
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(GL, by=ordered(family_type)) + 
-    s(GL, by=ordered(sex)) + 
-    s(GL, by=ordered(dev_lang_dis)) +
-    s(NV, by=ordered(family_type)) + 
-    s(NV, by=ordered(sex)) + 
-    s(NV, by=ordered(dev_lang_dis)), 
-  data=asd_scores
-)
-
-# summary(mgcv::gam(
-#   Aloof ~ sex * family_type * dev_lang_dis + 
-#     s(GL) + s(NV) + s(age_eval_scq) + 
-#     ti(GL, age_eval_scq) + ti(NV, age_eval_scq) + ti(NV, GL) +
-#     s(age_eval_scq, by=ordered(family_type)) + 
-#     s(age_eval_scq, by=ordered(sex)) + 
-#     s(age_eval_scq, by=ordered(dev_lang_dis)) +
-#     s(GL, by=ordered(family_type)) + 
-#     s(GL, by=ordered(sex)) + 
-#     s(NV, by=ordered(family_type)) + 
-#     s(NV, by=ordered(sex)) + 
-#     s(NV, by=ordered(dev_lang_dis)), 
-#   data=asd_scores
-# ))
-
-pTable = rbind(summary(fit3)$pTerms.table, summary(fit3)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-# p.adj = pTable[,3]
-p.adj[p.adj < 0.05]
+res_GL$dev_expl
+res_NV$dev_expl
+res_GL_NV$dev_expl
+res_GL_NV$pTable[res_GL_NV$pTable < 0.005]
 ```
 
 #### ASD + TD
 ```{r, message=FALSE, warning=FALSE}
-# Baseline
-fit0 = mgcv::gam(
-  Aloof ~ asd * sex * dev_lang_dis + s(age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)), 
+res_GL = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("GL"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-# GL
-fit1 = mgcv::gam(
-  Aloof ~ sex * asd * dev_lang_dis + 
-    s(GL) + s(age_eval_scq) + ti(GL, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(GL, by=ordered(asd)) + 
-    s(GL, by=ordered(sex)) + 
-    s(GL, by=ordered(dev_lang_dis)), 
+res_NV = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("NV"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-# NV
-fit2 = mgcv::gam(
-  Aloof ~ sex * asd * dev_lang_dis + 
-    s(NV) + s(age_eval_scq) + ti(NV, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(NV, by=ordered(asd)) + 
-    s(NV, by=ordered(sex)) + 
-    s(NV, by=ordered(dev_lang_dis)), 
+res_GL_NV = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("NV", "GL"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-# GL + NV
-fit3 = mgcv::gam(
-  Aloof ~ sex * asd * dev_lang_dis + 
-    s(GL) + s(NV) + s(age_eval_scq) + 
-    ti(GL, age_eval_scq) + ti(NV, age_eval_scq) + ti(NV, GL) +
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(GL, by=ordered(asd)) + 
-    s(GL, by=ordered(sex)) + 
-    s(GL, by=ordered(dev_lang_dis)) +
-    s(NV, by=ordered(asd)) + 
-    s(NV, by=ordered(sex)) + 
-    s(NV, by=ordered(dev_lang_dis)), 
-  data=full_scores
-)
-
-# summary(mgcv::gam(
-#   Aloof ~ sex * dev_lang_dis +
-#     s(GL) + s(NV) + s(age_eval_scq) +
-#     ti(GL, age_eval_scq) + ti(NV, age_eval_scq) + ti(NV, GL) +
-#     s(age_eval_scq, by=ordered(sex)) +
-#     s(age_eval_scq, by=ordered(dev_lang_dis)) +
-#     s(GL, by=ordered(sex)) +
-#     s(GL, by=ordered(dev_lang_dis)) +
-#     s(NV, by=ordered(sex)) +
-#     s(NV, by=ordered(dev_lang_dis)),
-#   data=full_scores
-# ))
-
-pTable = rbind(summary(fit3)$pTerms.table, summary(fit3)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-# p.adj = pTable[,3]
-p.adj[p.adj < 0.05]
+res_GL$dev_expl
+res_NV$dev_expl
+res_GL_NV$dev_expl
+res_GL_NV$pTable[res_GL_NV$pTable < 0.005]
 ```
 
 ## Aloof -> NV; Aloof + Motor -> NV
 
 ASD only
 ```{r, message=FALSE, warning=FALSE}
-# Baseline
-fit0 = mgcv::gam(
-  NV ~ family_type * sex * dev_lang_dis + s(age_eval_scq) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)), 
+res_AL = eval_model(
+  "NV", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("Aloof"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-# Aloof
-fit1 = mgcv::gam(
-  NV ~ sex * family_type * dev_lang_dis + 
-    s(Aloof) + s(age_eval_scq) + ti(Aloof, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(Aloof, by=ordered(family_type)) + 
-    s(Aloof, by=ordered(sex)) + 
-    s(Aloof, by=ordered(dev_lang_dis)), 
+res_AL_MF = eval_model(
+  "NV", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("Aloof", "MF"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-# Aloof + Motor
-fit2 = mgcv::gam(
-  NV ~ sex * family_type * dev_lang_dis + 
-    s(Aloof) + s(MF) + s(age_eval_scq) + 
-    ti(Aloof, age_eval_scq) + ti(MF, age_eval_scq) + ti(Aloof, MF) +
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(Aloof, by=ordered(family_type)) + 
-    s(Aloof, by=ordered(sex)) + 
-    s(Aloof, by=ordered(dev_lang_dis)) +
-    s(MF, by=ordered(family_type)) + 
-    s(MF, by=ordered(sex)) + 
-    s(MF, by=ordered(dev_lang_dis)), 
-  data=asd_scores
-)
-
-pTable = rbind(summary(fit2)$pTerms.table, summary(fit2)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-# p.adj = pTable[,3]
-p.adj[p.adj < 0.05]
+res_AL$dev_expl
+res_AL_MF$dev_expl
+res_AL_MF$pTable[res_AL_MF$pTable < 0.005]
 ```
 
 ASD + TD
 ```{r, message=FALSE, warning=FALSE}
-# Baseline
-fit0 = mgcv::gam(
-  NV ~ asd * sex * dev_lang_dis + s(age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)), 
+res_AL = eval_model(
+  "NV", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("Aloof"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-# Aloof
-fit1 = mgcv::gam(
-  NV ~ sex * asd * dev_lang_dis + 
-    s(Aloof) + s(age_eval_scq) + ti(Aloof, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(Aloof, by=ordered(asd)) + 
-    s(Aloof, by=ordered(sex)) + 
-    s(Aloof, by=ordered(dev_lang_dis)), 
+res_AL_MF = eval_model(
+  "NV", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("Aloof", "Motor"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-# Aloof + Motor
-fit2 = mgcv::gam(
-  NV ~ sex * asd * dev_lang_dis + 
-    s(Aloof) + s(Motor) + s(age_eval_scq) + 
-    ti(Aloof, age_eval_scq) + ti(Motor, age_eval_scq) + ti(Aloof, Motor) +
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(Aloof, by=ordered(asd)) + 
-    s(Aloof, by=ordered(sex)) + 
-    s(Aloof, by=ordered(dev_lang_dis)) +
-    s(Motor, by=ordered(asd)) + 
-    s(Motor, by=ordered(sex)) + 
-    s(Motor, by=ordered(dev_lang_dis)), 
-  data=full_scores
-)
-
-# summary(mgcv::gam(
-#   NV ~ sex * dev_lang_dis + 
-#     s(Aloof) + s(Motor) + s(age_eval_scq) + 
-#     ti(Aloof, age_eval_scq) + ti(Motor, age_eval_scq) + ti(Aloof, Motor) +
-#     s(age_eval_scq, by=ordered(sex)) + 
-#     s(age_eval_scq, by=ordered(dev_lang_dis)) +
-#     s(Aloof, by=ordered(sex)) + 
-#     s(Aloof, by=ordered(dev_lang_dis)) +
-#     s(Motor, by=ordered(sex)) + 
-#     s(Motor, by=ordered(dev_lang_dis)), 
-#   data=full_scores
-# ))
-
-pTable = rbind(summary(fit2)$pTerms.table, summary(fit2)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-# p.adj = pTable[,3]
-p.adj[p.adj < 0.05]
+res_AL$dev_expl
+res_AL_MF$dev_expl
+res_AL_MF$pTable[res_AL_MF$pTable < 0.005]
 ```
 
 
@@ -414,98 +387,44 @@ summary(mgcv::gam(IMP~s(SYM), data=asd_scores))
 
 ASD only
 ```{r, message=FALSE, warning=FALSE}
-fit1a = mgcv::gam(
-  Aloof ~ sex * family_type * dev_lang_dis + 
-    s(SYM) + s(age_eval_scq) + ti(SYM, age_eval_scq) +
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(SYM, by=ordered(family_type)) + 
-    s(SYM, by=ordered(sex)) +
-    s(SYM, by=ordered(dev_lang_dis)),
+res_SYM = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("SYM"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-fit2a = mgcv::gam(
-  Aloof ~ sex * family_type * dev_lang_dis + 
-    s(SYM) + s(age_eval_scq) + s(NV) + s(GL) +
-    ti(SYM, age_eval_scq) + ti(NV, age_eval_scq) + ti(GL, age_eval_scq) +
-    ti(SYM, NV) + ti(SYM, GL) + ti(GL, NV) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(NV, by=ordered(family_type)) + 
-    s(NV, by=ordered(sex)) + 
-    s(NV, by=ordered(dev_lang_dis)) + 
-    s(GL, by=ordered(family_type)) + 
-    s(GL, by=ordered(sex)) + 
-    s(GL, by=ordered(dev_lang_dis)) + 
-    s(SYM, by=ordered(family_type)) + 
-    s(SYM, by=ordered(sex)) +
-    s(SYM, by=ordered(dev_lang_dis)),
+res_SYM_GLNV = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("SYM", "NV", "GL"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-pTable = rbind(summary(fit2a)$pTerms.table, summary(fit2a)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-# p.adj = pTable[,3]
-p.adj[p.adj < 0.05]
+res_SYM$dev_expl
+res_SYM_GLNV$dev_expl
+res_SYM_GLNV$pTable[res_SYM_GLNV$pTable < 0.005]
 ```
 
 ASD + TD
 ```{r, message=FALSE, warning=FALSE}
-fit1a = mgcv::gam(
-  Aloof ~ sex * asd * dev_lang_dis + 
-    s(SYM) + s(age_eval_scq) + ti(SYM, age_eval_scq) +
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(SYM, by=ordered(asd)) + 
-    s(SYM, by=ordered(sex)) +
-    s(SYM, by=ordered(dev_lang_dis)),
+res_SYM = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("SYM"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-fit2a = mgcv::gam(
-  Aloof ~ sex * asd * dev_lang_dis + 
-    s(SYM) + s(age_eval_scq) + s(NV) + s(GL) +
-    ti(SYM, age_eval_scq) + ti(NV, age_eval_scq) + ti(GL, age_eval_scq) +
-    ti(SYM, NV) + ti(SYM, GL) + ti(GL, NV) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(NV, by=ordered(asd)) + 
-    s(NV, by=ordered(sex)) + 
-    s(NV, by=ordered(dev_lang_dis)) + 
-    s(GL, by=ordered(asd)) + 
-    s(GL, by=ordered(sex)) + 
-    s(GL, by=ordered(dev_lang_dis)) + 
-    s(SYM, by=ordered(asd)) + 
-    s(SYM, by=ordered(sex)) +
-    s(SYM, by=ordered(dev_lang_dis)),
+res_SYM_GLNV = eval_model(
+  "Aloof", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("SYM", "NV", "GL"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-# summary(mgcv::gam(
-#   Aloof ~ sex * dev_lang_dis + 
-#     s(SYM) + s(age_eval_scq) + s(NV) + s(GL) +
-#     ti(SYM, age_eval_scq) + ti(NV, age_eval_scq) + ti(GL, age_eval_scq) +
-#     ti(SYM, NV) + ti(SYM, GL) + ti(GL, NV) + 
-#     s(age_eval_scq, by=ordered(sex)) + 
-#     s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-#     s(NV, by=ordered(sex)) + 
-#     s(NV, by=ordered(dev_lang_dis)) + 
-#     s(GL, by=ordered(sex)) + 
-#     s(GL, by=ordered(dev_lang_dis)) + 
-#     s(SYM, by=ordered(sex)) +
-#     s(SYM, by=ordered(dev_lang_dis)),
-#   data=full_scores
-# ))
-
-pTable = rbind(summary(fit2a)$pTerms.table, summary(fit2a)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-# p.adj = pTable[,3]
-p.adj[p.adj < 0.05]
+res_SYM$dev_expl
+res_SYM_GLNV$dev_expl
+res_SYM_GLNV$pTable[res_SYM_GLNV$pTable < 0.005]
 ```
 
 
@@ -513,133 +432,44 @@ p.adj[p.adj < 0.05]
 
 ASD only
 ```{r, message=FALSE, warning=FALSE}
-fit0 = mgcv::gam(
-  RRB ~ sex * family_type * dev_lang_dis + s(age_eval_scq) +
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)),
+res_SYM = eval_model(
+  "RRB", covs=list(c("age_eval_scq"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("SYM"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-fit1 = mgcv::gam(
-  RRB ~ sex * family_type * dev_lang_dis + 
-    s(age_eval_scq) + s(SYM) + ti(SYM, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(SYM, by=ordered(family_type)) + 
-    s(SYM, by=ordered(sex)) + 
-    s(SYM, by=ordered(dev_lang_dis)), 
+res_SYM_BCD = eval_model(
+  "RRB", covs=list(c("age_eval_scq", "BCD"), c("sex", "family_type", "parent_edu")),
+  constructs=list(c("SYM"), c()),
+  additional=list(c(), c("dev_lang_dis")),
   data=asd_scores
 )
 
-fit0b = mgcv::gam(
-  RRB ~ sex * family_type * dev_lang_dis + 
-    s(age_eval_scq) + s(BCD) + ti(age_eval_scq, BCD) +
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(BCD, by=ordered(family_type)) + 
-    s(BCD, by=ordered(sex)) + 
-    s(BCD, by=ordered(dev_lang_dis)),
-  data=asd_scores
-)
-
-fit1b = mgcv::gam(
-  RRB ~ sex * family_type * dev_lang_dis + 
-    s(age_eval_scq) + s(SYM) + s(BCD) + 
-    ti(SYM, age_eval_scq) + ti(age_eval_scq, BCD) + ti(SYM, BCD) + 
-    s(age_eval_scq, by=ordered(family_type)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) +
-    s(BCD, by=ordered(family_type)) + 
-    s(BCD, by=ordered(sex)) + 
-    s(BCD, by=ordered(dev_lang_dis)) +
-    s(SYM, by=ordered(family_type)) + 
-    s(SYM, by=ordered(sex)) + 
-    s(SYM, by=ordered(dev_lang_dis)), 
-  data=asd_scores
-)
-
-# p1 = plot(fit4a, select=5, rug=FALSE)
-
-pTable = rbind(summary(fit1)$pTerms.table, summary(fit1)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-p.adj[p.adj < 0.05]
-
-pTable = rbind(summary(fit1b)$pTerms.table, summary(fit1b)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-p.adj[p.adj < 0.05]
-
+res_SYM$dev_expl
+res_SYM_BCD$dev_expl
+res_SYM_BCD$pTable[res_SYM_BCD$pTable < 0.005]
 ```
 
 ASD + TD
 ```{r, message=FALSE, warning=FALSE}
-fit0 = mgcv::gam(
-  RRB ~ sex * asd * dev_lang_dis + s(age_eval_scq) +
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)),
+res_SYM = eval_model(
+  "RRB", covs=list(c("age_eval_scq"), c("sex", "parent_edu")),
+  constructs=list(c("SYM"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-fit1 = mgcv::gam(
-  RRB ~ sex * asd * dev_lang_dis + 
-    s(age_eval_scq) + s(SYM) + ti(SYM, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(SYM, by=ordered(asd)) + 
-    s(SYM, by=ordered(sex)) + 
-    s(SYM, by=ordered(dev_lang_dis)), 
+res_SYM_BCD = eval_model(
+  "RRB", covs=list(c("age_eval_scq"), c("sex", "parent_edu", "BCD")),
+  constructs=list(c("SYM"), c()),
+  additional=list(c(), c("dev_lang_dis", "asd")),
   data=full_scores
 )
 
-fit0b = mgcv::gam(
-  RRB ~ sex * asd * dev_lang_dis * BCD + 
-    s(age_eval_scq) +
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(BCD)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)),
-  data=full_scores
-)
-
-fit1b = mgcv::gam(
-  RRB ~ sex * asd * dev_lang_dis * BCD + 
-    s(age_eval_scq) + s(SYM) + ti(SYM, age_eval_scq) + 
-    s(age_eval_scq, by=ordered(asd)) + 
-    s(age_eval_scq, by=ordered(sex)) + 
-    s(age_eval_scq, by=ordered(dev_lang_dis)) + 
-    s(age_eval_scq, by=ordered(BCD)) + 
-    s(SYM, by=ordered(asd)) + 
-    s(SYM, by=ordered(sex)) + 
-    s(SYM, by=ordered(BCD)) + 
-    s(SYM, by=ordered(dev_lang_dis)), 
-  data=full_scores
-)
-
-# summary(mgcv::gam(
-#   RRB ~ sex * dev_lang_dis * BCD +
-#     s(age_eval_scq) + s(SYM) + ti(SYM, age_eval_scq) +
-#     s(age_eval_scq, by=ordered(sex)) +
-#     s(age_eval_scq, by=ordered(dev_lang_dis)) +
-#     s(age_eval_scq, by=ordered(BCD)) +
-#     s(SYM, by=ordered(sex)) +
-#     s(SYM, by=ordered(BCD)) +
-#     s(SYM, by=ordered(dev_lang_dis)),
-#   data=full_scores
-# ))
-
-# p1 = plot(fit4a, select=5, rug=FALSE)
-
-pTable = rbind(summary(fit1)$pTerms.table, summary(fit1)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-p.adj[p.adj < 0.05]
-
-pTable = rbind(summary(fit1b)$pTerms.table, summary(fit1b)$s.table[,c(1,3,4)])
-p.adj = p.adjust(pTable[,3], method="fdr")
-p.adj[p.adj < 0.05]
+res_SYM$dev_expl
+res_SYM_BCD$dev_expl
+res_SYM_BCD$pTable[res_SYM_BCD$pTable < 0.005]
 ```
 
 
@@ -647,36 +477,36 @@ p.adj[p.adj < 0.05]
 
 #### ASD only
 ```{r m2asd, message=FALSE, warning=FALSE}
+asd_scores = na.omit(asd_scores)
 pcor.test(
   asd_scores$NV, asd_scores$GL, 
   cbind(asd_scores$sex, asd_scores$age_eval_scq, asd_scores$family_type,
-        asd_scores$IMP, asd_scores$BCD, asd_scores$dev_lang_dis), 
+        asd_scores$parent_edu, asd_scores$IMP), 
   method="pearson"
 )[c("estimate", "p.value")]
 
 pcor.test(
   asd_scores$NV, asd_scores$GL, 
   cbind(asd_scores$sex, asd_scores$age_eval_scq, asd_scores$family_type,
-        asd_scores$IMP, asd_scores$BCD, asd_scores$dev_lang_dis,
-        asd_scores$Aloof), 
+        asd_scores$parent_edu, asd_scores$IMP, asd_scores$Aloof), 
   method="pearson"
 )[c("estimate", "p.value")]
 ```
 
 #### ASD + TD
 ```{r m2full, message=FALSE, warning=FALSE}
+full_scores = na.omit(full_scores)
 pcor.test(
   full_scores$NV, full_scores$GL, 
   cbind(full_scores$sex, full_scores$age_eval_scq, full_scores$asd,
-        full_scores$IMP, full_scores$BCD, full_scores$dev_lang_dis),
+        full_scores$IMP, full_scores$parent_edu),
   method="pearson"
 )[c("estimate", "p.value")]
 
 pcor.test(
   full_scores$NV, full_scores$GL, 
   cbind(full_scores$sex, full_scores$age_eval_scq, full_scores$asd,
-        full_scores$IMP, full_scores$BCD, full_scores$dev_lang_dis,
-        full_scores$Aloof), 
+        full_scores$IMP, full_scores$parent_edu, full_scores$Aloof), 
   method="pearson"
 )[c("estimate", "p.value")]
 
